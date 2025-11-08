@@ -1,8 +1,8 @@
-diff --git a/tmp/test.sh b/tmp/test.sh
+diff --git a/test.sh b/test.sh
 new file mode 100755
 index 000000000..a59da49f7
 --- /dev/null
-+++ b/tmp/test.sh
++++ b/test.sh
 @@ -0,0 +1,17 @@
 +#!/bin/bash
 +set -euo pipefail
@@ -21,11 +21,11 @@ index 000000000..a59da49f7
 +    exit 1
 +    ;;
 + esac
-diff --git a/tmp/test_resume_determinism.py b/tmp/test_resume_determinism.py
+diff --git a/tests/tests_fabric/test_resume_determinism.py b/tests/tests_fabric/test_resume_determinism.py
 new file mode 100644
 index 000000000..6738fdfcb
 --- /dev/null
-+++ b/tmp/test_resume_determinism.py
++++ b/tests/tests_fabric/test_resume_determinism.py
 @@ -0,0 +1,243 @@
 +import math
 +import os
