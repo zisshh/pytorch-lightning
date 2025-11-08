@@ -4,9 +4,8 @@ WORKDIR /app
 # Copy repository contents
 COPY . .
 
-# Install Python + pytest and project dependencies
-RUN python -m pip install --upgrade pip \
- && python -m pip install pytest \
+# Install Python + pytest and project dependencies (do not upgrade package managers)
+RUN python -m pip install pytest \
  && if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi \
  && python -m pip install -e .
 
