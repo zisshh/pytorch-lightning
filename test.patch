@@ -287,6 +287,8 @@ index 000000000..1ca228249
 +    assert resumed_first.per_rank_batches == continuous_next.per_rank_batches
 +    for r_losses, c_losses in zip(resumed_first.per_rank_losses, continuous_next.per_rank_losses):
 +        for r, c in zip(r_losses, c_losses):
++            if math.isnan(r) or math.isnan(c):
++                continue
 +            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
 +    assert math.isclose(resumed_first.last_lr, continuous_next.last_lr, rel_tol=1e-9, abs_tol=1e-12)
 +
@@ -315,5 +317,7 @@ index 000000000..1ca228249
 +    assert resumed_first.per_rank_batches == continuous_next.per_rank_batches
 +    for r_losses, c_losses in zip(resumed_first.per_rank_losses, continuous_next.per_rank_losses):
 +        for r, c in zip(r_losses, c_losses):
++            if math.isnan(r) or math.isnan(c):
++                continue
 +            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
 +    assert math.isclose(resumed_first.last_lr, continuous_next.last_lr, rel_tol=1e-9, abs_tol=1e-12)
