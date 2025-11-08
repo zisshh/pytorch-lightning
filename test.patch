@@ -1,9 +1,9 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 000000000..2857b9e22
+index 000000000..4a6caa7be
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,20 @@
 +#!/bin/bash
 +set -euo pipefail
 +
@@ -12,8 +12,12 @@ index 000000000..2857b9e22
 +    pytest -q tests/tests_fabric/test_fabric.py::test_setup_dataloaders_distributed_sampler_parity
 +    ;;
 +  new)
-+    # Run only the minimal failing scenario to avoid timeouts/hangs
-+    pytest -q tests/tests_fabric/test_resume_determinism.py::test_resume_determinism_minimal
++    # Cover sampler A/B paths, shuffle off, and IterableDataset in fast, focused tests
++    pytest -q tests/tests_fabric/test_resume_determinism.py::test_resume_determinism_minimal_map_uds_true_shuffle_on || exit 1
++    pytest -q tests/tests_fabric/test_resume_determinism.py::test_resume_determinism_minimal_map_uds_false_shuffle_on || exit 1
++    pytest -q tests/tests_fabric/test_resume_determinism.py::test_resume_determinism_minimal_map_uds_true_shuffle_off || exit 1
++    pytest -q tests/tests_fabric/test_resume_determinism.py::test_resume_determinism_minimal_iterable_uds_true || exit 1
++    pytest -q tests/tests_fabric/test_resume_determinism.py::test_resume_determinism_minimal_iterable_uds_false || exit 1
 +    ;;
 +  *)
 +    echo "Usage: ./test.sh {base|new}" >&2
@@ -22,10 +26,10 @@ index 000000000..2857b9e22
 + esac
 diff --git a/tests/tests_fabric/test_resume_determinism.py b/tests/tests_fabric/test_resume_determinism.py
 new file mode 100644
-index 000000000..10a9b2743
+index 000000000..f4ae87a6b
 --- /dev/null
 +++ b/tests/tests_fabric/test_resume_determinism.py
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,357 @@
 +import math
 +import os
 +from dataclasses import dataclass
@@ -41,11 +45,7 @@ index 000000000..10a9b2743
 +
 +
 +class EpochAwareSampler(Sampler[int]):
-+    """Stateful sampler whose order is a function of epoch and supports state_dict.
-+
-+    - set_epoch(epoch) sets internal epoch used to derive order
-+    - state_dict()/load_state_dict() persist and restore epoch
-+    """
++    """Stateful sampler whose order is a function of epoch and supports state_dict."""
 +
 +    def __init__(self, size: int, base_seed: int = 123) -> None:
 +        self.size = size
@@ -63,7 +63,6 @@ index 000000000..10a9b2743
 +    def set_epoch(self, epoch: int) -> None:
 +        self.epoch = int(epoch)
 +
-+    # explicit state persistence API
 +    def state_dict(self):  # pragma: no cover - simple container
 +        return {"epoch": self.epoch}
 +
@@ -78,7 +77,6 @@ index 000000000..10a9b2743
 +
 +    def __iter__(self):
 +        for i in range(self.n):
-+            # yield float for model compatibility
 +            yield torch.tensor([i], dtype=torch.float32)
 +
 +
@@ -99,7 +97,6 @@ index 000000000..10a9b2743
 +
 +
 +def _all_gather_varlen(fabric: Fabric, seq: List[int | float], dtype: torch.dtype) -> List[List[float]]:
-+    """All-gather a 1D variable-length sequence across ranks and return per-rank lists trimmed to true length."""
 +    device = fabric.device
 +    t = torch.tensor(seq, device=device, dtype=dtype)
 +    llen = torch.tensor([t.numel()], device=device, dtype=torch.int64)
@@ -270,57 +267,108 @@ index 000000000..10a9b2743
 +    return cont_out, res_out
 +
 +
-+# Minimal failing scenario to avoid timeouts/hangs in CI
-+@pytest.mark.skipif(torch.get_num_threads() == 0, reason="CI sanity")
-+def test_resume_determinism_minimal(tmp_path):
-+    N, bs = 16, 2
-+    warmup, check = 1, 2
-+    ckpt = os.fspath(tmp_path / "ckpt_min.pt")
++# Minimal failing scenarios to cover required behaviors in CI
 +
++def _assert_resume_parity(cont: RunOut, res: RunOut) -> None:
++    assert res.per_rank_batches == cont.per_rank_batches
++    for r_losses, c_losses in zip(res.per_rank_losses, cont.per_rank_losses):
++        for r, c in zip(r_losses, c_losses):
++            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
++    assert math.isclose(res.last_lr, cont.last_lr, rel_tol=1e-9, abs_tol=1e-12)
++
++
++def test_resume_determinism_minimal_map_uds_true_shuffle_on(tmp_path):
++    N, bs = 16, 2
 +    cont, res = _launch_compare(
 +        map_dataset=True,
 +        shuffle=True,
 +        use_distributed_sampler=True,
 +        N=N,
 +        batch_size=bs,
-+        warmup_steps=warmup,
-+        check_steps=check,
-+        ckpt=ckpt,
++        warmup_steps=1,
++        check_steps=2,
++        ckpt=os.fspath(tmp_path / "ckpt_a.pt"),
 +    )
-+
-+    # Expected to fail on current implementation
-+    assert res.per_rank_batches == cont.per_rank_batches
-+    for r_losses, c_losses in zip(res.per_rank_losses, cont.per_rank_losses):
-+        for r, c in zip(r_losses, c_losses):
-+            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
-+    assert math.isclose(res.last_lr, cont.last_lr, rel_tol=1e-9, abs_tol=1e-12)
++    _assert_resume_parity(cont, res)
 +
 +
-+# Keep comprehensive tests in tree, but do not run by default in CI harness
++def test_resume_determinism_minimal_map_uds_false_shuffle_on(tmp_path):
++    N, bs = 16, 2
++    cont, res = _launch_compare(
++        map_dataset=True,
++        shuffle=True,
++        use_distributed_sampler=False,
++        N=N,
++        batch_size=bs,
++        warmup_steps=1,
++        check_steps=2,
++        ckpt=os.fspath(tmp_path / "ckpt_b.pt"),
++    )
++    _assert_resume_parity(cont, res)
++
++
++def test_resume_determinism_minimal_map_uds_true_shuffle_off(tmp_path):
++    N, bs = 16, 2
++    cont, res = _launch_compare(
++        map_dataset=True,
++        shuffle=False,
++        use_distributed_sampler=True,
++        N=N,
++        batch_size=bs,
++        warmup_steps=1,
++        check_steps=2,
++        ckpt=os.fspath(tmp_path / "ckpt_c.pt"),
++    )
++    _assert_resume_parity(cont, res)
++
++
++def test_resume_determinism_minimal_iterable_uds_true(tmp_path):
++    N, bs = 16, 2
++    cont, res = _launch_compare(
++        map_dataset=False,
++        shuffle=True,
++        use_distributed_sampler=True,
++        N=N,
++        batch_size=bs,
++        warmup_steps=1,
++        check_steps=2,
++        ckpt=os.fspath(tmp_path / "ckpt_d.pt"),
++    )
++    _assert_resume_parity(cont, res)
++
++
++def test_resume_determinism_minimal_iterable_uds_false(tmp_path):
++    N, bs = 16, 2
++    cont, res = _launch_compare(
++        map_dataset=False,
++        shuffle=True,
++        use_distributed_sampler=False,
++        N=N,
++        batch_size=bs,
++        warmup_steps=1,
++        check_steps=2,
++        ckpt=os.fspath(tmp_path / "ckpt_e.pt"),
++    )
++    _assert_resume_parity(cont, res)
++
++
++# Comprehensive tests retained (not executed by CI harness via test.sh)
 +@pytest.mark.parametrize("use_distributed_sampler", [True, False])
 +@pytest.mark.parametrize("map_dataset", [True, False])
 +@pytest.mark.parametrize("shuffle", [True, False])
 +def test_resume_determinism_mid_epoch(tmp_path, map_dataset, shuffle, use_distributed_sampler):
 +    N, bs = 16, 2
-+    warmup, check = 1, 2
-+    ckpt = os.fspath(tmp_path / "ckpt_mid.pt")
-+
 +    cont, res = _launch_compare(
 +        map_dataset=map_dataset,
 +        shuffle=shuffle,
 +        use_distributed_sampler=use_distributed_sampler,
 +        N=N,
 +        batch_size=bs,
-+        warmup_steps=warmup,
-+        check_steps=check,
-+        ckpt=ckpt,
++        warmup_steps=1,
++        check_steps=2,
++        ckpt=os.fspath(tmp_path / "ckpt_mid.pt"),
 +    )
-+
-+    assert res.per_rank_batches == cont.per_rank_batches
-+    for r_losses, c_losses in zip(res.per_rank_losses, cont.per_rank_losses):
-+        for r, c in zip(r_losses, c_losses):
-+            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
-+    assert math.isclose(res.last_lr, cont.last_lr, rel_tol=1e-9, abs_tol=1e-12)
++    _assert_resume_parity(cont, res)
 +
 +
 +@pytest.mark.parametrize("use_distributed_sampler", [True, False])
@@ -328,22 +376,14 @@ index 000000000..10a9b2743
 +@pytest.mark.parametrize("shuffle", [True, False])
 +def test_resume_determinism_across_epoch_boundary(tmp_path, map_dataset, shuffle, use_distributed_sampler):
 +    N, bs = 16, 2
-+    warmup, check = 4, 2
-+    ckpt = os.fspath(tmp_path / "ckpt_epoch.pt")
-+
 +    cont, res = _launch_compare(
 +        map_dataset=map_dataset,
 +        shuffle=shuffle,
 +        use_distributed_sampler=use_distributed_sampler,
 +        N=N,
 +        batch_size=bs,
-+        warmup_steps=warmup,
-+        check_steps=check,
-+        ckpt=ckpt,
++        warmup_steps=4,
++        check_steps=2,
++        ckpt=os.fspath(tmp_path / "ckpt_epoch.pt"),
 +    )
-+
-+    assert res.per_rank_batches == cont.per_rank_batches
-+    for r_losses, c_losses in zip(res.per_rank_losses, cont.per_rank_losses):
-+        for r, c in zip(r_losses, c_losses):
-+            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
-+    assert math.isclose(res.last_lr, cont.last_lr, rel_tol=1e-9, abs_tol=1e-12)
++    _assert_resume_parity(cont, res)
