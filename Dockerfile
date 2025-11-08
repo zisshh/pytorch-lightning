@@ -4,8 +4,9 @@ WORKDIR /app
 # Copy repository contents
 COPY . .
 
-# Install Python dependencies using pip (compatible with this repo's setup.py/requirements.txt)
+# Install Python + pytest and project dependencies
 RUN python -m pip install --upgrade pip \
+ && python -m pip install pytest \
  && if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi \
  && python -m pip install -e .
 
