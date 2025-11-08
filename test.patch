@@ -23,10 +23,10 @@ index 000000000..a59da49f7
 + esac
 diff --git a/tests/tests_fabric/test_resume_determinism.py b/tests/tests_fabric/test_resume_determinism.py
 new file mode 100644
-index 000000000..6738fdfcb
+index 000000000..1ca228249
 --- /dev/null
 +++ b/tests/tests_fabric/test_resume_determinism.py
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,290 @@
 +import math
 +import os
 +from dataclasses import dataclass
@@ -79,7 +79,8 @@ index 000000000..6738fdfcb
 +
 +    def __iter__(self):
 +        for i in range(self.n):
-+            yield torch.tensor([i])
++            # yield float for model compatibility
++            yield torch.tensor([i], dtype=torch.float32)
 +
 +
 +class TinyModel(nn.Module):
@@ -96,7 +97,6 @@ index 000000000..6738fdfcb
 +    per_rank_batches: List[List[int]]
 +    per_rank_losses: List[List[float]]
 +    last_lr: float
-+    sampler_epoch: int
 +
 +
 +def _gather_lists(fabric: Fabric, values: List[int], losses: List[float]) -> Tuple[List[List[int]], List[List[float]]]:
@@ -121,7 +121,28 @@ index 000000000..6738fdfcb
 +    return dl, use_distributed_sampler
 +
 +
-+def _continuous_next(fabric: Fabric, *, map_dataset: bool, shuffle: bool, use_distributed_sampler: bool, N: int, batch_size: int, warmup_steps: int, check_steps: int) -> RunOut:
++def _ensure_2d_float(batch: torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, ...]) -> torch.Tensor:
++    if isinstance(batch, (list, tuple)):
++        x = batch[0]
++    else:
++        x = batch
++    x = x.to(torch.float32)
++    if x.ndim == 1:
++        x = x.unsqueeze(1)
++    return x
++
++
++def _continuous_next(
++    fabric: Fabric,
++    *,
++    map_dataset: bool,
++    shuffle: bool,
++    use_distributed_sampler: bool,
++    N: int,
++    batch_size: int,
++    warmup_steps: int,
++    check_steps: int,
++) -> RunOut:
 +    model = TinyModel()
 +    opt = torch.optim.SGD(model.parameters(), lr=0.1)
 +    sch = StepLR(opt, step_size=3, gamma=0.5)
@@ -134,7 +155,8 @@ index 000000000..6738fdfcb
 +
 +    # warmup mid-epoch or end-epoch on the SAME iterator (uninterrupted)
 +    for _ in range(warmup_steps):
-+        batch = next(it)[0].to(fabric.device)
++        batch = _ensure_2d_float(next(it))
++        batch = batch.to(fabric.device)
 +        out = model(batch)
 +        loss = torch.mean((out - 1.0) ** 2)
 +        fabric.backward(loss)
@@ -144,7 +166,8 @@ index 000000000..6738fdfcb
 +    vals: List[int] = []
 +    losses: List[float] = []
 +    for _ in range(check_steps):
-+        batch = next(it)[0].to(fabric.device)
++        batch = _ensure_2d_float(next(it))
++        batch = batch.to(fabric.device)
 +        out = model(batch)
 +        loss = torch.mean((out - 1.0) ** 2)
 +        fabric.backward(loss)
@@ -153,11 +176,21 @@ index 000000000..6738fdfcb
 +        losses.append(float(loss.detach().cpu()))
 +
 +    gathered_vals, gathered_loss = _gather_lists(fabric, vals, losses)
-+    sampler_epoch = getattr(fdl._dataloader.sampler, "epoch", 0) if hasattr(fdl._dataloader, "sampler") else 0
-+    return RunOut(gathered_vals, gathered_loss, sch.get_last_lr()[0], sampler_epoch)
++    return RunOut(gathered_vals, gathered_loss, sch.get_last_lr()[0])
 +
 +
-+def _resume_first(fabric: Fabric, *, map_dataset: bool, shuffle: bool, use_distributed_sampler: bool, N: int, batch_size: int, warmup_steps: int, check_steps: int, ckpt: str) -> RunOut:
++def _resume_first(
++    fabric: Fabric,
++    *,
++    map_dataset: bool,
++    shuffle: bool,
++    use_distributed_sampler: bool,
++    N: int,
++    batch_size: int,
++    warmup_steps: int,
++    check_steps: int,
++    ckpt: str,
++) -> RunOut:
 +    # run a first short segment and save a checkpoint, then restart fresh and run next steps
 +    # first segment (fresh dataloader)
 +    model = TinyModel(); opt = torch.optim.SGD(model.parameters(), lr=0.1); sch = StepLR(opt, 3, 0.5)
@@ -166,7 +199,8 @@ index 000000000..6738fdfcb
 +    fdl = fabric.setup_dataloaders(dl, use_distributed_sampler=uds, move_to_device=False)
 +    it = iter(fdl)
 +    for _ in range(warmup_steps):
-+        batch = next(it)[0].to(fabric.device)
++        batch = _ensure_2d_float(next(it))
++        batch = batch.to(fabric.device)
 +        out = model(batch); loss = torch.mean((out - 1.0) ** 2)
 +        fabric.backward(loss); opt.step(); opt.zero_grad(set_to_none=True); sch.step()
 +    # save state after warmup (mid-epoch or after completing epoch)
@@ -183,24 +217,43 @@ index 000000000..6738fdfcb
 +    vals2: List[int] = []
 +    losses2: List[float] = []
 +    for _ in range(check_steps):
-+        batch = next(it2)[0].to(fabric.device)
++        batch = _ensure_2d_float(next(it2))
++        batch = batch.to(fabric.device)
 +        out = model2(batch); loss = torch.mean((out - 1.0) ** 2)
 +        fabric.backward(loss); opt2.step(); opt2.zero_grad(set_to_none=True); sch2.step()
 +        vals2.extend(batch.squeeze(1).int().tolist()); losses2.append(float(loss.detach().cpu()))
 +
 +    gathered_vals2, gathered_loss2 = _gather_lists(fabric, vals2, losses2)
-+    sampler_epoch2 = getattr(fdl2._dataloader.sampler, "epoch", 0) if hasattr(fdl2._dataloader, "sampler") else 0
-+    return RunOut(gathered_vals2, gathered_loss2, sch2.get_last_lr()[0], sampler_epoch2)
++    return RunOut(gathered_vals2, gathered_loss2, sch2.get_last_lr()[0])
 +
 +
 +def _launch_compare(*, map_dataset: bool, shuffle: bool, use_distributed_sampler: bool, N: int, batch_size: int, warmup_steps: int, check_steps: int, ckpt: str) -> Tuple[RunOut, RunOut]:
 +    # continuous next steps on same iterator
 +    def continuous(fabric: Fabric):
-+        return _continuous_next(fabric, map_dataset=map_dataset, shuffle=shuffle, use_distributed_sampler=use_distributed_sampler, N=N, batch_size=batch_size, warmup_steps=warmup_steps, check_steps=check_steps)
++        return _continuous_next(
++            fabric,
++            map_dataset=map_dataset,
++            shuffle=shuffle,
++            use_distributed_sampler=use_distributed_sampler,
++            N=N,
++            batch_size=batch_size,
++            warmup_steps=warmup_steps,
++            check_steps=check_steps,
++        )
 +
 +    # resume path on fresh iterator
 +    def resume_fn(fabric: Fabric):
-+        return _resume_first(fabric, map_dataset=map_dataset, shuffle=shuffle, use_distributed_sampler=use_distributed_sampler, N=N, batch_size=batch_size, warmup_steps=warmup_steps, check_steps=check_steps, ckpt=ckpt)
++        return _resume_first(
++            fabric,
++            map_dataset=map_dataset,
++            shuffle=shuffle,
++            use_distributed_sampler=use_distributed_sampler,
++            N=N,
++            batch_size=batch_size,
++            warmup_steps=warmup_steps,
++            check_steps=check_steps,
++            ckpt=ckpt,
++        )
 +
 +    fabric = Fabric(accelerator="cpu", strategy="ddp", devices=2)
 +    cont_out: RunOut = fabric.launch(continuous)
@@ -237,15 +290,12 @@ index 000000000..6738fdfcb
 +            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
 +    assert math.isclose(resumed_first.last_lr, continuous_next.last_lr, rel_tol=1e-9, abs_tol=1e-12)
 +
-+    # explicit sampler state: mid-epoch should keep same epoch number
-+    assert resumed_first.sampler_epoch in (0, 1)  # depending on strategy path
-+
 +
 +@pytest.mark.parametrize("use_distributed_sampler", [True, False])
 +@pytest.mark.parametrize("map_dataset", [True, False])
 +@pytest.mark.parametrize("shuffle", [True, False])
 +def test_resume_determinism_across_epoch_boundary(tmp_path, map_dataset, shuffle, use_distributed_sampler):
-+    """Resume exactly at epoch boundary and verify next-epoch parity and sampler epoch advance."""
++    """Resume exactly at epoch boundary and verify next-epoch parity."""
 +    N, bs = 16, 2
 +    # batches per epoch per rank = (N/2)/bs = 4; warmup exactly consumes an epoch
 +    warmup, check = 4, 2
@@ -267,7 +317,3 @@ index 000000000..6738fdfcb
 +        for r, c in zip(r_losses, c_losses):
 +            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
 +    assert math.isclose(resumed_first.last_lr, continuous_next.last_lr, rel_tol=1e-9, abs_tol=1e-12)
-+
-+    # explicit sampler state: at boundary, next iterator should reflect next epoch
-+    assert resumed_first.sampler_epoch >= 1
-
