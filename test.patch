@@ -1,18 +1,20 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 000000000..ad437487d
+index 000000000..a59da49f7
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,17 @@
 +#!/bin/bash
 +set -euo pipefail
 +
 +case "${1:-}" in
 +  base)
++    # Existing, stable test expected to pass
 +    pytest -q tests/tests_fabric/test_fabric.py::test_setup_dataloaders_distributed_sampler_parity
 +    ;;
 +  new)
-+    pytest -vv -s tests/tests_fabric/test_resume_determinism.py -k "resume_determinism"
++    # New behavior tests (expected to fail before fix)
++    pytest -q tests/tests_fabric/test_resume_determinism.py -k "resume_determinism"
 +    ;;
 +  *)
 +    echo "Usage: ./test.sh {base|new}" >&2
@@ -21,13 +23,12 @@ index 000000000..ad437487d
 + esac
 diff --git a/tests/tests_fabric/test_resume_determinism.py b/tests/tests_fabric/test_resume_determinism.py
 new file mode 100644
-index 000000000..f8653f523
+index 000000000..e6e2331dc
 --- /dev/null
 +++ b/tests/tests_fabric/test_resume_determinism.py
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,308 @@
 +import math
 +import os
-+import random
 +from dataclasses import dataclass
 +from typing import List, Tuple
 +
@@ -98,19 +99,32 @@ index 000000000..f8653f523
 +    last_lr: float
 +
 +
-+def _seed_all(seed: int) -> None:
-+    random.seed(seed)
-+    torch.manual_seed(seed)
++def _all_gather_varlen(fabric: Fabric, seq: List[int | float], dtype: torch.dtype) -> List[List[float]]:
++    """All-gather a 1D variable-length sequence across ranks and return per-rank lists trimmed to true length.
 +
-+
-+def _gather_lists(fabric: Fabric, values: List[int], losses: List[float]) -> Tuple[List[List[int]], List[List[float]]]:
++    We first gather lengths, pad to max length with zeros, all_gather the padded tensor, and then trim using the gathered lengths.
++    """
 +    device = fabric.device
-+    Lv, Ll = len(values), len(losses)
-+    m = max(Lv, Ll)
-+    v = torch.tensor(values + [0] * (m - Lv), device=device)
-+    l = torch.tensor(losses + [math.nan] * (m - Ll), device=device)
-+    gv = fabric.all_gather(v).cpu().tolist()
-+    gl = fabric.all_gather(l).cpu().tolist()
++    t = torch.tensor(seq, device=device, dtype=dtype)
++    llen = torch.tensor([t.numel()], device=device, dtype=torch.int64)
++    lens = fabric.all_gather(llen).squeeze(1).cpu().tolist()
++    max_len = int(max(lens) if len(lens) > 0 else 0)
++    if t.numel() < max_len:
++        pad = torch.zeros(max_len - t.numel(), device=device, dtype=t.dtype)
++        t = torch.cat([t, pad], dim=0)
++    gathered = fabric.all_gather(t).cpu()  # [world_size, max_len]
++    out: List[List[float]] = []
++    for r, L in enumerate(lens):
++        L = int(L)
++        vals = gathered[r, :L].tolist() if max_len > 0 else []
++        out.append(vals)
++    return out
++
++
++def _gather_values_and_losses(fabric: Fabric, values: List[int], losses: List[float]) -> Tuple[List[List[int]], List[List[float]]]:
++    gv = _all_gather_varlen(fabric, values, torch.int64)
++    gl = _all_gather_varlen(fabric, losses, torch.float32)
++    # type: ignore[return-value]
 +    return gv, gl
 +
 +
@@ -147,8 +161,6 @@ index 000000000..f8653f523
 +    warmup_steps: int,
 +    check_steps: int,
 +) -> RunOut:
-+    _seed_all(1337 + int(fabric.global_rank))
-+
 +    model = TinyModel()
 +    opt = torch.optim.SGD(model.parameters(), lr=0.1)
 +    sch = StepLR(opt, step_size=3, gamma=0.5)
@@ -181,7 +193,7 @@ index 000000000..f8653f523
 +        vals.extend(batch.squeeze(1).int().tolist())
 +        losses.append(float(loss.detach().cpu()))
 +
-+    gathered_vals, gathered_loss = _gather_lists(fabric, vals, losses)
++    gathered_vals, gathered_loss = _gather_values_and_losses(fabric, vals, losses)
 +    return RunOut(gathered_vals, gathered_loss, sch.get_last_lr()[0])
 +
 +
@@ -197,8 +209,6 @@ index 000000000..f8653f523
 +    check_steps: int,
 +    ckpt: str,
 +) -> RunOut:
-+    _seed_all(1337 + int(fabric.global_rank))
-+
 +    # run a first short segment and save a checkpoint, then restart fresh and run next steps
 +    # first segment (fresh dataloader)
 +    model = TinyModel(); opt = torch.optim.SGD(model.parameters(), lr=0.1); sch = StepLR(opt, 3, 0.5)
@@ -231,14 +241,14 @@ index 000000000..f8653f523
 +        fabric.backward(loss); opt2.step(); opt2.zero_grad(set_to_none=True); sch2.step()
 +        vals2.extend(batch.squeeze(1).int().tolist()); losses2.append(float(loss.detach().cpu()))
 +
-+    gathered_vals2, gathered_loss2 = _gather_lists(fabric, vals2, losses2)
++    gathered_vals2, gathered_loss2 = _gather_values_and_losses(fabric, vals2, losses2)
 +    return RunOut(gathered_vals2, gathered_loss2, sch2.get_last_lr()[0])
 +
 +
 +def _launch_compare(*, map_dataset: bool, shuffle: bool, use_distributed_sampler: bool, N: int, batch_size: int, warmup_steps: int, check_steps: int, ckpt: str) -> Tuple[RunOut, RunOut]:
-+    def _worker(fabric: Fabric) -> Tuple[RunOut, RunOut]:
-+        # run both flows under a single distributed context to avoid multiple spawns
-+        cont = _continuous_next(
++    # continuous next steps on same iterator
++    def continuous(fabric: Fabric):
++        return _continuous_next(
 +            fabric,
 +            map_dataset=map_dataset,
 +            shuffle=shuffle,
@@ -248,7 +258,10 @@ index 000000000..f8653f523
 +            warmup_steps=warmup_steps,
 +            check_steps=check_steps,
 +        )
-+        res = _resume_first(
++
++    # resume path on fresh iterator
++    def resume_fn(fabric: Fabric):
++        return _resume_first(
 +            fabric,
 +            map_dataset=map_dataset,
 +            shuffle=shuffle,
@@ -259,10 +272,14 @@ index 000000000..f8653f523
 +            check_steps=check_steps,
 +            ckpt=ckpt,
 +        )
-+        return cont, res
 +
 +    fabric = Fabric(accelerator="cpu", strategy="ddp", devices=2)
-+    return fabric.launch(_worker)
++    cont_out: RunOut = fabric.launch(continuous)
++
++    fabric2 = Fabric(accelerator="cpu", strategy="ddp", devices=2)
++    res_out: RunOut = fabric2.launch(resume_fn)
++
++    return cont_out, res_out
 +
 +
 +@pytest.mark.parametrize("use_distributed_sampler", [True, False])
@@ -288,8 +305,6 @@ index 000000000..f8653f523
 +    assert resumed_first.per_rank_batches == continuous_next.per_rank_batches
 +    for r_losses, c_losses in zip(resumed_first.per_rank_losses, continuous_next.per_rank_losses):
 +        for r, c in zip(r_losses, c_losses):
-+            if math.isnan(r) or math.isnan(c):
-+                continue
 +            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
 +    assert math.isclose(resumed_first.last_lr, continuous_next.last_lr, rel_tol=1e-9, abs_tol=1e-12)
 +
@@ -318,7 +333,5 @@ index 000000000..f8653f523
 +    assert resumed_first.per_rank_batches == continuous_next.per_rank_batches
 +    for r_losses, c_losses in zip(resumed_first.per_rank_losses, continuous_next.per_rank_losses):
 +        for r, c in zip(r_losses, c_losses):
-+            if math.isnan(r) or math.isnan(c):
-+                continue
 +            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
 +    assert math.isclose(resumed_first.last_lr, continuous_next.last_lr, rel_tol=1e-9, abs_tol=1e-12)
