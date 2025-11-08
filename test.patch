@@ -1,3 +1,24 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..a70b41d50
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++set -euo pipefail
++
++case "${1:-}" in
++  base)
++    pytest -q tests/tests_fabric/test_fabric.py::test_setup_dataloaders_distributed_sampler_parity
++    ;;
++  new)
++    pytest -q tests/tests_fabric/test_resume_custom_sampler.py
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}" >&2
++    exit 1
++    ;;
++ esac
 diff --git a/tests/tests_fabric/test_resume_custom_sampler.py b/tests/tests_fabric/test_resume_custom_sampler.py
 new file mode 100644
 index 000000000..e7878fc27
