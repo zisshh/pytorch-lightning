@@ -270,3 +270,4 @@ index 000000000..6738fdfcb
 +
 +    # explicit sampler state: at boundary, next iterator should reflect next epoch
 +    assert resumed_first.sampler_epoch >= 1
+
