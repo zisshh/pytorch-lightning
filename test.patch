@@ -236,9 +236,9 @@ index 000000000..f8653f523
 +
 +
 +def _launch_compare(*, map_dataset: bool, shuffle: bool, use_distributed_sampler: bool, N: int, batch_size: int, warmup_steps: int, check_steps: int, ckpt: str) -> Tuple[RunOut, RunOut]:
-+    # continuous next steps on same iterator
-+    def continuous(fabric: Fabric):
-+        return _continuous_next(
++    def _worker(fabric: Fabric) -> Tuple[RunOut, RunOut]:
++        # run both flows under a single distributed context to avoid multiple spawns
++        cont = _continuous_next(
 +            fabric,
 +            map_dataset=map_dataset,
 +            shuffle=shuffle,
@@ -248,10 +248,7 @@ index 000000000..f8653f523
 +            warmup_steps=warmup_steps,
 +            check_steps=check_steps,
 +        )
-+
-+    # resume path on fresh iterator
-+    def resume_fn(fabric: Fabric):
-+        return _resume_first(
++        res = _resume_first(
 +            fabric,
 +            map_dataset=map_dataset,
 +            shuffle=shuffle,
@@ -262,14 +259,10 @@ index 000000000..f8653f523
 +            check_steps=check_steps,
 +            ckpt=ckpt,
 +        )
++        return cont, res
 +
-+    fabric = Fabric(accelerator="cpu", devices=1)
-+    cont_out: RunOut = fabric.launch(continuous)
-+
-+    fabric2 = Fabric(accelerator="cpu", devices=1)
-+    res_out: RunOut = fabric2.launch(resume_fn)
-+
-+    return cont_out, res_out
++    fabric = Fabric(accelerator="cpu", strategy="ddp", devices=2)
++    return fabric.launch(_worker)
 +
 +
 +@pytest.mark.parametrize("use_distributed_sampler", [True, False])
