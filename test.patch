@@ -1,45 +1,48 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 000000000..a70b41d50
+index 000000000..a59da49f7
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,17 @@
 +#!/bin/bash
 +set -euo pipefail
 +
 +case "${1:-}" in
 +  base)
++    # Existing, stable test expected to pass
 +    pytest -q tests/tests_fabric/test_fabric.py::test_setup_dataloaders_distributed_sampler_parity
 +    ;;
 +  new)
-+    pytest -q tests/tests_fabric/test_resume_custom_sampler.py
++    # New behavior tests (expected to fail before fix)
++    pytest -q tests/tests_fabric/test_resume_determinism.py -k "resume_determinism"
 +    ;;
 +  *)
 +    echo "Usage: ./test.sh {base|new}" >&2
 +    exit 1
 +    ;;
 + esac
-diff --git a/tests/tests_fabric/test_resume_custom_sampler.py b/tests/tests_fabric/test_resume_custom_sampler.py
+diff --git a/tests/tests_fabric/test_resume_determinism.py b/tests/tests_fabric/test_resume_determinism.py
 new file mode 100644
-index 000000000..e7878fc27
+index 000000000..91188dbf5
 --- /dev/null
-+++ b/tests/tests_fabric/test_resume_custom_sampler.py
-@@ -0,0 +1,88 @@
-+import torch
-+from torch.utils.data import DataLoader, Sampler, TensorDataset
-+import random
++++ b/tests/tests_fabric/test_resume_determinism.py
+@@ -0,0 +1,202 @@
++import math
++import os
++from dataclasses import dataclass
++from typing import List, Tuple
 +
 +import pytest
++import torch
++from torch import nn
++from torch.optim.lr_scheduler import StepLR
++from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, TensorDataset
 +
 +from lightning.fabric import Fabric
 +
 +
 +class EpochAwareSampler(Sampler[int]):
-+    """A simple stateful sampler that changes order based on epoch.
-+
-+    - Maintains an internal epoch counter set via set_epoch.
-+    - Shuffles deterministically from a base seed and epoch.
-+    """
++    """Stateful sampler whose order is a function of epoch."""
 +
 +    def __init__(self, size: int, base_seed: int = 123) -> None:
 +        self.size = size
@@ -50,66 +53,179 @@ index 000000000..e7878fc27
 +        return self.size
 +
 +    def __iter__(self):  # type: ignore[override]
-+        g = random.Random(self.base_seed + self.epoch)
-+        order = list(range(self.size))
-+        g.shuffle(order)
++        g = torch.Generator().manual_seed(self.base_seed + int(self.epoch))
++        order = torch.randperm(self.size, generator=g).tolist()
 +        return iter(order)
 +
 +    def set_epoch(self, epoch: int) -> None:
 +        self.epoch = int(epoch)
 +
 +
-+def _make_dataloader(N: int = 12, batch_size: int = 2, use_distributed_sampler: bool = True):
-+    # values equal their indices for easy comparison
-+    dataset = TensorDataset(torch.arange(N))
-+    sampler = EpochAwareSampler(N, base_seed=7)
-+    dl = DataLoader(dataset, sampler=sampler, batch_size=batch_size)
++class CountingIterable(IterableDataset):
++    def __init__(self, n: int):
++        super().__init__()
++        self.n = n
++
++    def __iter__(self):
++        for i in range(self.n):
++            yield torch.tensor([i])
++
++
++class TinyModel(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.lin = nn.Linear(1, 1)
++
++    def forward(self, x):
++        return self.lin(x)
++
++
++@dataclass
++class RunOut:
++    per_rank_batches: List[List[int]]
++    per_rank_losses: List[List[float]]
++    last_lr: float
++
++
++def _collect_per_rank(fabric: Fabric, rank_values: List[int], rank_losses: List[float]) -> Tuple[List[List[int]], List[List[float]]]:
++    # gather lengths for safe padding (fabric.all_gather requires tensors)
++    device = fabric.device
++    max_len = max(len(rank_values), len(rank_losses))
++    pad_vals = torch.tensor(rank_values + [0] * (max_len - len(rank_values)), device=device)
++    pad_loss = torch.tensor(rank_losses + [math.nan] * (max_len - len(rank_losses)), device=device)
++
++    gathered_vals = fabric.all_gather(pad_vals).cpu().tolist()
++    gathered_loss = fabric.all_gather(pad_loss).cpu().tolist()
++
++    # trim padding by original lengths (assume equal lengths across ranks in these tests)
++    return gathered_vals, gathered_loss
++
++
++def _build_loader(map_dataset: bool, shuffle: bool, use_distributed_sampler: bool, N: int = 8, batch_size: int = 2):
++    if map_dataset:
++        ds: Dataset = TensorDataset(torch.arange(N).unsqueeze(1).float())
++        sampler = EpochAwareSampler(len(ds)) if shuffle else None
++        dl = DataLoader(ds, batch_size=batch_size, sampler=sampler, shuffle=False)
++    else:
++        ds = CountingIterable(N)
++        dl = DataLoader(ds, batch_size=batch_size)
 +    return dl, use_distributed_sampler
 +
 +
-+def _wrap_with_fabric(dl, use_distributed_sampler: bool):
++def _segment(fabric: Fabric, *, map_dataset: bool, shuffle: bool, use_distributed_sampler: bool, steps: int, ckpt: str = "", resume: bool = False) -> RunOut:
++    model = TinyModel()
++    opt = torch.optim.SGD(model.parameters(), lr=0.1)
++    sch = StepLR(opt, step_size=3, gamma=0.5)
++
++    if resume:
++        fabric.load(ckpt, {"model": model, "optimizer": opt, "scheduler": sch})
++
++    model, opt = fabric.setup(model, opt)
++    dl, uds = _build_loader(map_dataset, shuffle, use_distributed_sampler)
++    fdl = fabric.setup_dataloaders(dl, use_distributed_sampler=uds, move_to_device=False)
++
++    per_rank_batches: List[int] = []
++    per_rank_losses: List[float] = []
++
++    it = iter(fdl)
++    for _ in range(steps):
++        batch = next(it)[0].to(fabric.device)
++        out = model(batch)
++        loss = torch.mean((out - 1.0) ** 2)
++        fabric.backward(loss)
++        opt.step()
++        opt.zero_grad(set_to_none=True)
++        sch.step()
++
++        per_rank_batches.extend(batch.squeeze(1).int().tolist())
++        per_rank_losses.append(float(loss.detach().cpu()))
++
++    # save only when not resuming
++    if not resume and ckpt:
++        fabric.save(ckpt, {"model": model, "optimizer": opt, "scheduler": sch})
++
++    gathered_vals, gathered_loss = _collect_per_rank(fabric, per_rank_batches, per_rank_losses)
++
++    return RunOut(gathered_vals, gathered_loss, sch.get_last_lr()[0])
++
++
++def _launch_and_run(map_dataset: bool, shuffle: bool, use_distributed_sampler: bool, steps_warmup: int, steps_check: int, ckpt: str) -> Tuple[RunOut, RunOut]:
++    # continuous run: warmup + check in one launch
++    def continuous(fabric: Fabric):
++        c1 = _segment(fabric, map_dataset=map_dataset, shuffle=shuffle, use_distributed_sampler=use_distributed_sampler, steps=steps_warmup, ckpt=ckpt, resume=False)
++        c2 = _segment(fabric, map_dataset=map_dataset, shuffle=shuffle, use_distributed_sampler=use_distributed_sampler, steps=steps_check, ckpt="", resume=False)
++        return c1, c2
++
++    # resume run: warmup then restart from ckpt and run check steps
++    def resume_run(fabric: Fabric):
++        _ = _segment(fabric, map_dataset=map_dataset, shuffle=shuffle, use_distributed_sampler=use_distributed_sampler, steps=steps_warmup, ckpt=ckpt, resume=False)
++        r = _segment(fabric, map_dataset=map_dataset, shuffle=shuffle, use_distributed_sampler=use_distributed_sampler, steps=steps_check, ckpt=ckpt, resume=True)
++        return r
++
++    # launch 2-device cpu ddp
 +    fabric = Fabric(accelerator="cpu", strategy="ddp", devices=2)
-+    # emulate launched state as other Fabric tests do
-+    fabric._launched = True
-+    return fabric, fabric.setup_dataloaders(dl, use_distributed_sampler=use_distributed_sampler, move_to_device=False)
++    cont_out: Tuple[RunOut, RunOut] = fabric.launch(continuous)
++
++    fabric2 = Fabric(accelerator="cpu", strategy="ddp", devices=2)
++    res_out: RunOut = fabric2.launch(resume_run)
++
++    # unpack
++    continuous_next = cont_out[1]
++    resumed_first = res_out
++    return continuous_next, resumed_first
 +
 +
-+def _first_two_batches_values(fabric_dl):
-+    it = iter(fabric_dl)
-+    a = next(it)[0].tolist()
-+    b = next(it)[0].tolist()
-+    return a + b
-+
-+
++@pytest.mark.parametrize("map_dataset", [True, False])
++@pytest.mark.parametrize("shuffle", [True, False])
 +@pytest.mark.parametrize("use_distributed_sampler", [True, False])
-+def test_resume_should_match_continuous_next_steps(use_distributed_sampler):
++def test_resume_determinism_parity(tmp_path, map_dataset, shuffle, use_distributed_sampler):
++    """Parity test across ranks: batch indices and losses after resume must match continuous run.
++
++    This exercises:
++    - Map vs Iterable datasets
++    - shuffle on/off
++    - use_distributed_sampler True/False
++    - LR scheduler, model, optimizer restoration
 +    """
-+    Continuous vs. resume parity:
-+    - Continuous: iterate once (simulate K steps), then record next two batches.
-+    - Resume: recreate Fabric/dataloader (simulating fresh process resume) and record first two batches.
 +
-+    Expected behavior (this test encodes): resume must match the continuous next steps.
-+    Current base behavior: fails because Fabric does not persist dataloader/sampler epoch/counter, so ordering resets.
-+    """
++    ckpt = os.fspath(tmp_path / "ckpt.pt")
++    steps_warmup, steps_check = 2, 2
 +
-+    torch.manual_seed(1)
-+    dl, uds = _make_dataloader(use_distributed_sampler=use_distributed_sampler)
-+    fabric, fdl = _wrap_with_fabric(dl, uds)
++    continuous_next, resumed_first = _launch_and_run(
++        map_dataset=map_dataset,
++        shuffle=shuffle,
++        use_distributed_sampler=use_distributed_sampler,
++        steps_warmup=steps_warmup,
++        steps_check=steps_check,
++        ckpt=ckpt,
++    )
 +
-+    # Simulate progress before checkpoint (consume one epoch/iteration context)
-+    _ = _first_two_batches_values(fdl)  # advance internal counter used to set sampler epoch
-+
-+    # Continuous run: what comes next, without recreating dataloader/fabric
-+    continuous_next = _first_two_batches_values(fdl)
-+
-+    # Simulate resume: recreate fabric and dataloader from scratch
-+    torch.manual_seed(1)
-+    dl2, uds2 = _make_dataloader(use_distributed_sampler=use_distributed_sampler)
-+    fabric2, fdl2 = _wrap_with_fabric(dl2, uds2)
-+
-+    resumed_first = _first_two_batches_values(fdl2)
-+
-+    # Required: resumed ordering must equal continuous_next
++    # Per-rank batch parity
 +    assert (
-+        resumed_first == continuous_next
-+    ), "Resumed sampler ordering diverges from continuous run; dataloader/sampler state must be restored on resume."
++        resumed_first.per_rank_batches == continuous_next.per_rank_batches
++    ), "Per-rank batch index parity must hold after resume"
++
++    # Per-rank loss parity (allow tiny tolerance)
++    for r_losses, c_losses in zip(resumed_first.per_rank_losses, continuous_next.per_rank_losses):
++        assert len(r_losses) == len(c_losses)
++        for r, c in zip(r_losses, c_losses):
++            assert math.isclose(r, c, rel_tol=1e-6, abs_tol=1e-6)
++
++    # LR scheduler parity
++    assert math.isclose(resumed_first.last_lr, continuous_next.last_lr, rel_tol=1e-9, abs_tol=1e-12)
++
++
++# Focus runner for the checker (short runtime) covering shuffle=True on map dataset
++@pytest.mark.parametrize("use_distributed_sampler", [True, False])
++def test_resume_determinism_smoke_resume_on_map_shuffle(tmp_path, use_distributed_sampler):
++    ckpt = os.fspath(tmp_path / "ckpt.pt")
++    steps_warmup, steps_check = 1, 2
++    continuous_next, resumed_first = _launch_and_run(
++        map_dataset=True,
++        shuffle=True,
++        use_distributed_sampler=use_distributed_sampler,
++        steps_warmup=steps_warmup,
++        steps_check=steps_check,
++        ckpt=ckpt,
++    )
++    assert resumed_first.per_rank_batches == continuous_next.per_rank_batches
