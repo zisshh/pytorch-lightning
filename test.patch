@@ -1,0 +1,94 @@
+diff --git a/tests/tests_fabric/test_resume_custom_sampler.py b/tests/tests_fabric/test_resume_custom_sampler.py
+new file mode 100644
+index 000000000..111111111
+--- /dev/null
++++ b/tests/tests_fabric/test_resume_custom_sampler.py
+@@ -0,0 +1,160 @@
++import torch
++from torch.utils.data import DataLoader, Sampler, TensorDataset
++import random
++
++import pytest
++
++from lightning.fabric import Fabric
++
++
++class EpochAwareSampler(Sampler[int]):
++    """A simple stateful sampler that changes order based on epoch.
++
++    - Maintains an internal epoch counter set via set_epoch.
++    - Shuffles deterministically from a base seed and epoch.
++    """
++
++    def __init__(self, size: int, base_seed: int = 123) -> None:
++        self.size = size
++        self.base_seed = base_seed
++        self.epoch = 0
++
++    def __len__(self) -> int:  # type: ignore[override]
++        return self.size
++
++    def __iter__(self):  # type: ignore[override]
++        g = random.Random(self.base_seed + self.epoch)
++        order = list(range(self.size))
++        g.shuffle(order)
++        return iter(order)
++
++    def set_epoch(self, epoch: int) -> None:
++        self.epoch = int(epoch)
++
++
++def _make_dataloader(N: int = 12, batch_size: int = 2, use_distributed_sampler: bool = True):
++    # values equal their indices for easy comparison
++    dataset = TensorDataset(torch.arange(N))
++    sampler = EpochAwareSampler(N, base_seed=7)
++    dl = DataLoader(dataset, sampler=sampler, batch_size=batch_size)
++    return dl, use_distributed_sampler
++
++
++def _wrap_with_fabric(dl, use_distributed_sampler: bool):
++    fabric = Fabric(accelerator="cpu", strategy="ddp", devices=2)
++    # emulate launched state as other Fabric tests do
++    fabric._launched = True
++    return fabric, fabric.setup_dataloaders(dl, use_distributed_sampler=use_distributed_sampler, move_to_device=False)
++
++
++def _first_two_batches_values(fabric_dl):
++    it = iter(fabric_dl)
++    a = next(it)[0].tolist()
++    b = next(it)[0].tolist()
++    return a + b
++
++
++@pytest.mark.parametrize("use_distributed_sampler", [True, False])
++def test_resume_should_match_continuous_next_steps(use_distributed_sampler):
++    """
++    Continuous vs. resume parity:
++    - Continuous: iterate once (simulate K steps), then record next two batches.
++    - Resume: recreate Fabric/dataloader (simulating fresh process resume) and record first two batches.
++
++    Expected behavior (this test encodes): resume must match the continuous next steps.
++    Current base behavior: fails because Fabric does not persist dataloader/sampler epoch/counter, so ordering resets.
++    """
++
++    torch.manual_seed(1)
++    dl, uds = _make_dataloader(use_distributed_sampler=use_distributed_sampler)
++    fabric, fdl = _wrap_with_fabric(dl, uds)
++
++    # Simulate progress before checkpoint (consume one epoch/iteration context)
++    _ = _first_two_batches_values(fdl)  # advance internal counter used to set sampler epoch
++
++    # Continuous run: what comes next, without recreating dataloader/fabric
++    continuous_next = _first_two_batches_values(fdl)
++
++    # Simulate resume: recreate fabric and dataloader from scratch
++    torch.manual_seed(1)
++    dl2, uds2 = _make_dataloader(use_distributed_sampler=use_distributed_sampler)
++    fabric2, fdl2 = _wrap_with_fabric(dl2, uds2)
++
++    resumed_first = _first_two_batches_values(fdl2)
++
++    # Required: resumed ordering must equal continuous_next
++    assert (
++        resumed_first == continuous_next
++    ), "Resumed sampler ordering diverges from continuous run; dataloader/sampler state must be restored on resume."
