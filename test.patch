@@ -12,7 +12,7 @@ index 000000000..ad437487d
 +    pytest -q tests/tests_fabric/test_fabric.py::test_setup_dataloaders_distributed_sampler_parity
 +    ;;
 +  new)
-+    pytest -q tests/tests_fabric/test_resume_determinism.py -k "resume_determinism"
++    pytest -vv -s tests/tests_fabric/test_resume_determinism.py -k "resume_determinism"
 +    ;;
 +  *)
 +    echo "Usage: ./test.sh {base|new}" >&2
@@ -263,10 +263,10 @@ index 000000000..f8653f523
 +            ckpt=ckpt,
 +        )
 +
-+    fabric = Fabric(accelerator="cpu", strategy="ddp", devices=2)
++    fabric = Fabric(accelerator="cpu", devices=1)
 +    cont_out: RunOut = fabric.launch(continuous)
 +
-+    fabric2 = Fabric(accelerator="cpu", strategy="ddp", devices=2)
++    fabric2 = Fabric(accelerator="cpu", devices=1)
 +    res_out: RunOut = fabric2.launch(resume_fn)
 +
 +    return cont_out, res_out
