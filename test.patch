@@ -1,19 +1,17 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 000000000..a59da49f7
+index 000000000..ad437487d
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,15 @@
 +#!/bin/bash
 +set -euo pipefail
 +
 +case "${1:-}" in
 +  base)
-+    # Existing, stable test expected to pass
 +    pytest -q tests/tests_fabric/test_fabric.py::test_setup_dataloaders_distributed_sampler_parity
 +    ;;
 +  new)
-+    # New behavior tests (expected to fail before fix)
 +    pytest -q tests/tests_fabric/test_resume_determinism.py -k "resume_determinism"
 +    ;;
 +  *)
@@ -23,12 +21,13 @@ index 000000000..a59da49f7
 + esac
 diff --git a/tests/tests_fabric/test_resume_determinism.py b/tests/tests_fabric/test_resume_determinism.py
 new file mode 100644
-index 000000000..1ca228249
+index 000000000..f8653f523
 --- /dev/null
 +++ b/tests/tests_fabric/test_resume_determinism.py
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,304 @@
 +import math
 +import os
++import random
 +from dataclasses import dataclass
 +from typing import List, Tuple
 +
@@ -99,6 +98,11 @@ index 000000000..1ca228249
 +    last_lr: float
 +
 +
++def _seed_all(seed: int) -> None:
++    random.seed(seed)
++    torch.manual_seed(seed)
++
++
 +def _gather_lists(fabric: Fabric, values: List[int], losses: List[float]) -> Tuple[List[List[int]], List[List[float]]]:
 +    device = fabric.device
 +    Lv, Ll = len(values), len(losses)
@@ -143,6 +147,8 @@ index 000000000..1ca228249
 +    warmup_steps: int,
 +    check_steps: int,
 +) -> RunOut:
++    _seed_all(1337 + int(fabric.global_rank))
++
 +    model = TinyModel()
 +    opt = torch.optim.SGD(model.parameters(), lr=0.1)
 +    sch = StepLR(opt, step_size=3, gamma=0.5)
@@ -191,6 +197,8 @@ index 000000000..1ca228249
 +    check_steps: int,
 +    ckpt: str,
 +) -> RunOut:
++    _seed_all(1337 + int(fabric.global_rank))
++
 +    # run a first short segment and save a checkpoint, then restart fresh and run next steps
 +    # first segment (fresh dataloader)
 +    model = TinyModel(); opt = torch.optim.SGD(model.parameters(), lr=0.1); sch = StepLR(opt, 3, 0.5)
